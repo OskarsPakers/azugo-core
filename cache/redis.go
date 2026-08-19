@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"azugo.io/core/instrumenter"
@@ -20,8 +21,62 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
+// conn is a Redis connection shared by all cache instances of a cache.
+//
+// The client is established on first use and a failed attempt is retried on the next one.
+// The valkey client connects and completes the handshake when it is created, so creating
+// it eagerly makes an unreachable cache fatal for the whole application: a cache that is
+// down while the application starts (or an Istio sidecar that is not ready yet) would
+// take the process down instead of failing the operations that need the cache.
+type conn struct {
+	create func() (valkey.Client, error)
+	mu     sync.Mutex
+	client valkey.Client
+	closed bool
+}
+
+func newConn(create func() (valkey.Client, error)) *conn {
+	return &conn{create: create}
+}
+
+// get returns the shared client, connecting if the connection is not established yet.
+func (c *conn) get() (valkey.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil, ErrCacheClosed
+	}
+
+	if c.client != nil {
+		return c.client, nil
+	}
+
+	client, err := c.create()
+	if err != nil {
+		return nil, err
+	}
+
+	c.client = client
+
+	return client, nil
+}
+
+// close releases the client. Any further operation returns ErrCacheClosed.
+func (c *conn) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client != nil {
+		c.client.Close()
+		c.client = nil
+	}
+
+	c.closed = true
+}
+
 type redisCache[T any] struct {
-	con            valkey.Client
+	con            *conn
 	typ            Type
 	name           string
 	prefix         string
@@ -31,7 +86,7 @@ type redisCache[T any] struct {
 	instrumenter   instrumenter.Instrumenter
 }
 
-func newRedisCache[T any](prefix string, con valkey.Client, opts ...Option) Instance[T] {
+func newRedisCache[T any](prefix string, con *conn, opts ...Option) Instance[T] {
 	opt := newCacheOptions(opts...)
 
 	keyPrefix := opt.KeyPrefix
@@ -151,37 +206,45 @@ func newValkeyClient(copt valkey.ClientOption, o *cacheOptions) (valkey.Client, 
 	return valkey.NewClient(copt)
 }
 
-func newRedisClient(o *cacheOptions) (valkey.Client, error) {
+func newRedisClient(o *cacheOptions) (*conn, error) {
 	copt, err := valkey.ParseURL(o.ConnectionString)
 	if err != nil {
 		return nil, err
 	}
 
-	return newValkeyClient(copt, o)
+	return newConn(func() (valkey.Client, error) {
+		return newValkeyClient(copt, o)
+	}), nil
 }
 
-func newRedisSentinelClient(o *cacheOptions) (valkey.Client, error) {
+func newRedisSentinelClient(o *cacheOptions) (*conn, error) {
 	copt, err := parseRedisSentinelURL(o.ConnectionString)
 	if err != nil {
 		return nil, err
 	}
 
-	return newValkeyClient(copt, o)
+	return newConn(func() (valkey.Client, error) {
+		return newValkeyClient(copt, o)
+	}), nil
 }
 
 func (c *redisCache[T]) Get(ctx context.Context, key string, opts ...ItemOption[T]) (T, error) {
 	val := new(T)
-	if c.con == nil {
-		return *val, ErrCacheClosed
-	}
 
 	finish := c.observe(ctx, InstrumentationGet, key)
 
+	con, err := c.con.get()
+	if err != nil {
+		finish(err)
+
+		return *val, err
+	}
+
 	var res valkey.ValkeyResult
 	if c.clientCacheTTL > 0 {
-		res = c.con.DoCache(ctx, c.con.B().Get().Key(c.prefix+key).Cache(), c.clientCacheTTL)
+		res = con.DoCache(ctx, con.B().Get().Key(c.prefix+key).Cache(), c.clientCacheTTL)
 	} else {
-		res = c.con.Do(ctx, c.con.B().Get().Key(c.prefix+key).Build())
+		res = con.Do(ctx, con.B().Get().Key(c.prefix+key).Build())
 	}
 
 	if res.IsCacheHit() {
@@ -239,14 +302,19 @@ func (c *redisCache[T]) Get(ctx context.Context, key string, opts ...ItemOption[
 
 func (c *redisCache[T]) Pop(ctx context.Context, key string) (T, error) {
 	val := new(T)
-	if c.con == nil {
-		return *val, ErrCacheClosed
-	}
 
 	finishG := c.observe(ctx, InstrumentationGet, key)
 	finishD := c.observe(ctx, InstrumentationDelete, key)
 
-	v, err := c.con.Do(ctx, c.con.B().Getdel().Key(c.prefix+key).Build()).ToString()
+	con, err := c.con.get()
+	if err != nil {
+		finishD(err)
+		finishG(err)
+
+		return *val, err
+	}
+
+	v, err := con.Do(ctx, con.B().Getdel().Key(c.prefix+key).Build()).ToString()
 	if valkey.IsValkeyNil(err) {
 		finishD(nil)
 		finishG(nil)
@@ -276,11 +344,14 @@ func (c *redisCache[T]) Pop(ctx context.Context, key string) (T, error) {
 }
 
 func (c *redisCache[T]) Set(ctx context.Context, key string, value T, opts ...ItemOption[T]) error {
-	if c.con == nil {
-		return ErrCacheClosed
-	}
-
 	finish := c.observe(ctx, InstrumentationSet, key)
+
+	con, err := c.con.get()
+	if err != nil {
+		finish(err)
+
+		return err
+	}
 
 	buf, err := json.Marshal(value)
 	if err != nil {
@@ -297,7 +368,7 @@ func (c *redisCache[T]) Set(ctx context.Context, key string, value T, opts ...It
 		ttl = opt.TTL
 	}
 
-	cmd := c.con.B().Set().Key(c.prefix + key).Value(string(buf))
+	cmd := con.B().Set().Key(c.prefix + key).Value(string(buf))
 
 	var completed valkey.Completed
 	if ttl > 0 {
@@ -306,7 +377,7 @@ func (c *redisCache[T]) Set(ctx context.Context, key string, value T, opts ...It
 		completed = cmd.Build()
 	}
 
-	if err := c.con.Do(ctx, completed).Error(); err != nil {
+	if err := con.Do(ctx, completed).Error(); err != nil {
 		finish(err)
 
 		return err
@@ -318,13 +389,16 @@ func (c *redisCache[T]) Set(ctx context.Context, key string, value T, opts ...It
 }
 
 func (c *redisCache[T]) Delete(ctx context.Context, key string) error {
-	if c.con == nil {
-		return ErrCacheClosed
-	}
-
 	finish := c.observe(ctx, InstrumentationDelete, key)
 
-	if err := c.con.Do(ctx, c.con.B().Del().Key(c.prefix+key).Build()).Error(); err != nil {
+	con, err := c.con.get()
+	if err != nil {
+		finish(err)
+
+		return err
+	}
+
+	if err := con.Do(ctx, con.B().Del().Key(c.prefix+key).Build()).Error(); err != nil {
 		finish(err)
 
 		return err
@@ -336,20 +410,16 @@ func (c *redisCache[T]) Delete(ctx context.Context, key string) error {
 }
 
 func (c *redisCache[T]) Ping(ctx context.Context) error {
-	if c.con == nil {
-		return nil
+	con, err := c.con.get()
+	if err != nil {
+		return err
 	}
 
-	return c.con.Do(ctx, c.con.B().Ping().Build()).Error()
+	return con.Do(ctx, con.B().Ping().Build()).Error()
 }
 
 func (c *redisCache[T]) Close() error {
-	if c.con == nil {
-		return nil
-	}
-
-	c.con.Close()
-	c.con = nil
+	c.con.close()
 
 	return nil
 }

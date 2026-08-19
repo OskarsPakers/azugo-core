@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -151,6 +152,47 @@ func TestRedisCacheExpire(t *testing.T) {
 	qt.Check(t, qt.Equals(val, ""))
 }
 
+func TestRedisCacheUnreachable(t *testing.T) {
+	// An unreachable cache must fail the operations that need it, not the whole
+	// application: the connection is established on first use and retried later.
+	c := New(RedisCache, ConnectionString("redis://127.0.0.1:1"))
+	qt.Assert(t, qt.IsNil(c.Start(context.TODO())))
+
+	i, err := Create[string](c, "test")
+	qt.Assert(t, qt.IsNil(err))
+
+	qt.Check(t, qt.IsNotNil(i.Set(context.TODO(), "key", "value")))
+
+	_, err = i.Get(context.TODO(), "key")
+	qt.Check(t, qt.IsNotNil(err))
+	qt.Check(t, qt.IsNotNil(c.Ping(context.TODO())))
+
+	// The connection error is reported to the caller instead of a nil client.
+	_, err = c.Connection()
+	qt.Check(t, qt.IsNotNil(err))
+
+	c.Close()
+
+	// A closed cache is reported as closed, not as unreachable.
+	qt.Check(t, qt.IsTrue(errors.Is(i.Set(context.TODO(), "key", "value"), ErrCacheClosed)))
+
+	_, err = c.Connection()
+	qt.Check(t, qt.IsTrue(errors.Is(err, ErrCacheClosed)))
+}
+
+func TestConnectionNotStarted(t *testing.T) {
+	c := New(RedisCache, ConnectionString("redis://127.0.0.1:1"))
+
+	_, err := c.Connection()
+	qt.Check(t, qt.IsTrue(errors.Is(err, ErrCacheNotStarted)))
+}
+
+func TestRedisCacheInvalidConnectionString(t *testing.T) {
+	// A broken connection string is a configuration error and stays fatal.
+	c := New(RedisCache, ConnectionString("http://localhost:6379"))
+	qt.Check(t, qt.IsNotNil(c.Start(context.TODO())))
+}
+
 func TestClientCacheOptions(t *testing.T) {
 	opt := newCacheOptions(ClientCacheTTL(time.Minute))
 	qt.Check(t, qt.Equals(opt.ClientCacheTTL, time.Minute))
@@ -204,7 +246,8 @@ func TestRedisCacheClientCache(t *testing.T) {
 	qt.Check(t, qt.IsTrue(hits >= 1))
 
 	// External write invalidates the locally cached value.
-	con := c.Connection()
+	con, err := c.Connection()
+	qt.Assert(t, qt.IsNil(err))
 	err = con.Do(ctx, con.B().Set().Key("cctest:key").Value(`"value2"`).Build()).Error()
 	qt.Assert(t, qt.IsNil(err))
 

@@ -76,3 +76,21 @@ func TestCacheInstrumentation(t *testing.T) {
 		cache.InstrumentationClose + ":end",
 	}))
 }
+
+func TestCacheStartsWhenUnreachable(t *testing.T) {
+	// A cache that is unreachable while the application starts must not stop the
+	// application: only the operations that need the cache fail, and the connection is
+	// established once the cache is available again.
+	t.Setenv("CACHE_TYPE", "redis")
+	t.Setenv("CACHE_CONNECTION", "redis://127.0.0.1:1")
+
+	a, cleanup, _, err := newTestApp()
+	qt.Assert(t, qt.IsNil(err))
+	t.Cleanup(cleanup)
+
+	qt.Assert(t, qt.IsNil(a.Start()))
+
+	c, err := cache.Create[string](a.Cache(), "test")
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.IsNotNil(c.Set(context.TODO(), "key", "value")))
+}

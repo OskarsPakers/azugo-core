@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	mrand "math/rand/v2"
 	"time"
 
@@ -161,9 +162,9 @@ func connection(c *cache.Cache) (valkey.Client, bool, error) {
 		return nil, false, nil
 	}
 
-	con := c.Connection()
-	if con == nil {
-		return nil, false, errors.New("cache must be started before creating a rate limiter")
+	con, err := c.Connection()
+	if err != nil {
+		return nil, false, fmt.Errorf("cache connection is not available: %w", err)
 	}
 
 	return con, true, nil

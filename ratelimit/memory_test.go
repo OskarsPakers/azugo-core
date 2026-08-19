@@ -50,7 +50,7 @@ func TestNewRedisCacheNotStarted(t *testing.T) {
 	c := cache.New(cache.RedisCache, cache.ConnectionString("redis://localhost:6379/0"))
 
 	_, err := NewFixedWindow(c, "test", 5, time.Minute)
-	qt.Check(t, qt.ErrorMatches(err, "cache must be started before creating a rate limiter"))
+	qt.Check(t, qt.ErrorMatches(err, "cache connection is not available: cache is not started"))
 }
 
 func TestFixedWindowAllow(t *testing.T) {

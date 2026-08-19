@@ -28,6 +28,10 @@ const (
 // ErrCacheClosed is returned when an operation is attempted on a closed cache.
 var ErrCacheClosed = errors.New("cache closed")
 
+// ErrCacheNotStarted is returned when a Redis connection is requested from a cache that
+// has not been started or has no Redis backend.
+var ErrCacheNotStarted = errors.New("cache is not started")
+
 // KeyNotFoundError is returned when a cache key is not found.
 type KeyNotFoundError struct {
 	Key string
@@ -41,7 +45,7 @@ func (e KeyNotFoundError) Error() string {
 type Cache struct {
 	options     []Option
 	cache       map[string]any
-	redisCon    valkey.Client
+	redisCon    *conn
 	redisConStr string
 }
 
@@ -89,7 +93,7 @@ func (c *Cache) Start(ctx context.Context) error {
 	}
 
 	var (
-		con valkey.Client
+		con *conn
 		err error
 	)
 
@@ -124,11 +128,11 @@ func (c *Cache) Close() {
 
 	switch opt.Type {
 	case RedisCache, RedisClusterCache, RedisSentinelCache:
+		// The connection is kept, closed, so that a closed cache reports itself as closed
+		// instead of as never started.
 		if c.redisCon != nil {
-			c.redisCon.Close()
+			c.redisCon.close()
 		}
-
-		c.redisCon = nil
 	case MemoryCache:
 		// nothing to close
 	}
@@ -142,9 +146,15 @@ func (c *Cache) Close() {
 	c.cache = nil
 }
 
-// Connection returns the underlying Redis client shared by the cache.
-func (c *Cache) Connection() valkey.Client {
-	return c.redisCon
+// Connection returns the underlying Redis client shared by the cache, connecting if the
+// connection is not established yet. Returns ErrCacheNotStarted if the cache has no Redis
+// backend, ErrCacheClosed if it has been closed, or the connection error.
+func (c *Cache) Connection() (valkey.Client, error) {
+	if c.redisCon == nil {
+		return nil, ErrCacheNotStarted
+	}
+
+	return c.redisCon.get()
 }
 
 // ConfiguredType returns the cache type the cache was created with.
@@ -169,7 +179,14 @@ func (c *Cache) Ping(ctx context.Context) error {
 	finish := opt.Instrumenter.Observe(ctx, InstrumentationPing)
 
 	if opt.Type != MemoryCache && c.redisCon != nil {
-		if err := c.redisCon.Do(ctx, c.redisCon.B().Ping().Build()).Error(); err != nil {
+		con, err := c.redisCon.get()
+		if err != nil {
+			finish(err)
+
+			return err
+		}
+
+		if err := con.Do(ctx, con.B().Ping().Build()).Error(); err != nil {
 			finish(err)
 
 			return err

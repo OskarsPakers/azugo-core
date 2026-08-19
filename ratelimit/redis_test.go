@@ -218,7 +218,8 @@ func TestRedisFixedWindowPreservesCounterWithoutTTL(t *testing.T) {
 
 	ctx := context.TODO()
 
-	con := c.Connection()
+	con, err := c.Connection()
+	qt.Assert(t, qt.IsNil(err))
 	err = con.Do(ctx, con.B().Set().Key(limiterRedisKey(c, name, "key")).Value("3").Build()).Error()
 	qt.Assert(t, qt.IsNil(err))
 
@@ -237,7 +238,8 @@ func TestRedisScriptsHandleNonNumericState(t *testing.T) {
 	fw, err := NewFixedWindow(c, fwName, 3, time.Minute)
 	qt.Assert(t, qt.IsNil(err))
 
-	con := c.Connection()
+	con, err := c.Connection()
+	qt.Assert(t, qt.IsNil(err))
 	err = con.Do(ctx, con.B().Set().Key(limiterRedisKey(c, fwName, "key")).Value("bad").Build()).Error()
 	qt.Assert(t, qt.IsNil(err))
 
